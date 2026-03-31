@@ -1,6 +1,6 @@
 import { OnenotePage, SectionGroup, User, PublicError, Notebook, OnenoteSection } from '@microsoft/microsoft-graph-types';
 import { DataWriteOptions, Notice, Setting, TFolder, htmlToMarkdown, ObsidianProtocolData, requestUrl, moment } from 'obsidian';
-import { genUid, extractErrorMessage, parseHTML, sanitizeFileName } from '../util';
+import { genUid, extractErrorMessage, parseHTML, sanitizeFileName, serializeFrontMatter } from '../util';
 import { FormatImporter } from '../format-importer';
 import { ATTACHMENT_EXTS, AUTH_REDIRECT_URI, ImportContext } from '../main';
 import { AccessTokenResponse } from './onenote/models';
@@ -64,6 +64,12 @@ export class OneNoteImporter extends FormatImporter {
 	// Settings
 	importPreviouslyImported: boolean = false;
 	importIncompatibleAttachments: boolean = false;
+	pagePrefix: 'none' | 'number' | 'date' = 'none';
+	minDigits: number = 2;
+	useParentPrefix: boolean = false;
+	parentPrefixText: string = '_ ';
+	pageTitleProperty: 'never' | 'changed' | 'always' = 'never';
+	addPageDate: boolean = false;
 	// UI
 	microsoftAccountSetting: Setting;
 	switchUserSetting: Setting;
@@ -98,6 +104,87 @@ export class OneNoteImporter extends FormatImporter {
 			.addToggle((toggle) => toggle
 				.setValue(true)
 				.onChange((value) => (this.importPreviouslyImported = !value))
+			);
+
+		// File naming collapsible section
+		const fileNamingSection = this.modal.contentEl.createEl('details');
+		fileNamingSection.createEl('summary', { text: 'File naming' });
+
+		const minDigitsSetting = new Setting(fileNamingSection)
+			.setName('Minimum number of digits')
+			.addText(text => text
+				.setValue(String(this.minDigits))
+				.onChange(value => {
+					const num = parseInt(value);
+					if (!isNaN(num) && num >= 1) {
+						this.minDigits = num;
+					}
+				})
+				.then(({ inputEl }) => {
+					inputEl.type = 'number';
+					inputEl.min = '1';
+				})
+			);
+		minDigitsSetting.settingEl.toggle(this.pagePrefix === 'number');
+
+		new Setting(fileNamingSection)
+			.setName('Prefix page file names')
+			.addDropdown(dropdown => {
+				dropdown
+					.addOption('none', 'None')
+					.addOption('number', 'Page number')
+					.addOption('date', 'Page date')
+					.setValue(this.pagePrefix)
+					.onChange(value => {
+						this.pagePrefix = value as 'none' | 'number' | 'date';
+						minDigitsSetting.settingEl.toggle(value === 'number');
+					});
+			});
+
+		const parentPrefixTextSetting = new Setting(fileNamingSection)
+			.setName('File name prefix for parent page content')
+			.addText(text => text
+				.setValue(this.parentPrefixText)
+				.onChange(value => {
+					this.parentPrefixText = value;
+				})
+			);
+		parentPrefixTextSetting.settingEl.toggle(this.useParentPrefix);
+
+		new Setting(fileNamingSection)
+			.setName('Use special prefix for parent page content')
+			.addToggle(toggle => toggle
+				.setValue(this.useParentPrefix)
+				.onChange(value => {
+					this.useParentPrefix = value;
+					parentPrefixTextSetting.settingEl.toggle(value);
+				})
+			);
+
+		// File properties collapsible section
+		const filePropertiesSection = this.modal.contentEl.createEl('details');
+		filePropertiesSection.createEl('summary', { text: 'File properties' });
+
+		new Setting(filePropertiesSection)
+			.setName('Add pagetitle file property')
+			.addDropdown(dropdown => {
+				dropdown
+					.addOption('never', 'Never')
+					.addOption('changed', 'When changed')
+					.addOption('always', 'Always')
+					.setValue(this.pageTitleProperty)
+					.onChange(value => {
+						this.pageTitleProperty = value as 'never' | 'changed' | 'always';
+					});
+			});
+
+		new Setting(filePropertiesSection)
+			.setName('Add pagedate file property')
+			.addToggle(toggle => toggle
+				.setValue(this.addPageDate)
+				.onChange(value => {
+					this.addPageDate = value;
+				})
 			);
 
 		let authenticated = false;
@@ -466,7 +553,7 @@ export class OneNoteImporter extends FormatImporter {
 
 					await this.processFile(progress,
 						await this.fetchResource(`https://graph.microsoft.com/v1.0/me/onenote/pages/${page.id}/content?includeInkML=true`, 'text', progress),
-						page);
+						page, pages, i);
 
 					if (page.id) {
 						previouslyImported.add(page.id);
@@ -539,7 +626,7 @@ export class OneNoteImporter extends FormatImporter {
 		}
 	}
 
-	async processFile(progress: ImportContext, content: string, page: OnenotePage) {
+	async processFile(progress: ImportContext, content: string, page: OnenotePage, pages: OnenotePage[], pageIndex: number) {
 		try {
 			const splitContent = this.convertFormat(content);
 			const outputFolder = await this.getOutputFolder();
@@ -585,7 +672,49 @@ export class OneNoteImporter extends FormatImporter {
 				mdContent += inkEmbedMarkdown;
 			}
 
-			const fileRef = await this.saveAsMarkdownFile(pageFolder, page.title!, mdContent);
+			// Build file name with optional prefix
+			let fileName = page.title!;
+
+			if (this.pagePrefix === 'number') {
+				const digits = Math.max(this.minDigits, String(pages.length).length);
+				const paddedNumber = String(pageIndex + 1).padStart(digits, '0');
+				fileName = `${paddedNumber} ${fileName}`;
+			}
+			else if (this.pagePrefix === 'date' && page.createdDateTime) {
+				const dateStr = moment.utc(page.createdDateTime).format('YYYY-MM-DD');
+				fileName = `${dateStr} ${fileName}`;
+			}
+
+			if (this.useParentPrefix) {
+				const isParent = pageIndex < pages.length - 1
+					&& (pages[pageIndex + 1].level ?? 0) > (page.level ?? 0);
+				if (isParent) {
+					fileName = `${this.parentPrefixText}${fileName}`;
+				}
+			}
+
+			// Build front matter
+			const frontMatter: Record<string, any> = {};
+
+			if (this.pageTitleProperty === 'always') {
+				frontMatter.pagetitle = page.title!;
+			}
+			else if (this.pageTitleProperty === 'changed') {
+				if (sanitizeFileName(page.title!) !== page.title!) {
+					frontMatter.pagetitle = page.title!;
+				}
+			}
+
+			if (this.addPageDate && page.createdDateTime) {
+				frontMatter.pagedate = moment.utc(page.createdDateTime).format('YYYY-MM-DDTHH:mm:ss');
+			}
+
+			const frontMatterStr = serializeFrontMatter(frontMatter);
+			if (frontMatterStr) {
+				mdContent = frontMatterStr + mdContent;
+			}
+
+			const fileRef = await this.saveAsMarkdownFile(pageFolder, fileName, mdContent);
 
 			// Add the last modified and creation time metadata
 			const lastModified = page?.lastModifiedDateTime ? Date.parse(page.lastModifiedDateTime) : null;
